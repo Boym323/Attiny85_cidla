@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+
 #define PIN_napajeni_optosenzoru 1
 #define PIN_SV 3
 #define PIN_TV 4
