@@ -6,3 +6,4 @@
 .travis.yml
 platformio.ini
 platformio.ini
+.DS_Store
