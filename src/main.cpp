@@ -1,143 +1,160 @@
 #include <Arduino.h>
 
+#include <avr/interrupt.h>
 #include <avr/sleep.h>
-#include <avr/power.h>
 #include <avr/wdt.h>
 
-#define PIN_napajeni_optosenzoru 1
-#define PIN_SV 8
-#define PIN_TV 9
-#define LitrSV 13
-#define LitrTV 14
+#ifndef __AVR_ATtiny85__
+#error "This firmware is intended for ATtiny85."
+#endif
 
-volatile int impuls_z_wdt = 1;
+// ATtiny85 (DIP-8) pin mapping used by this project:
+// Arduino 0 = PB0 = physical pin 5 -> cold-water output pulse
+// Arduino 1 = PB1 = physical pin 6 -> optical-sensor power
+// Arduino 2 = PB2 = physical pin 7 -> hot-water output pulse
+// Arduino 3 = PB3 = physical pin 2 -> cold-water sensor input
+// Arduino 4 = PB4 = physical pin 3 -> hot-water sensor input
+// PB5 / physical pin 1 remains RESET.
+constexpr uint8_t PIN_LITR_SV = 0;
+constexpr uint8_t PIN_NAPAJENI_OPTOSENZORU = 1;
+constexpr uint8_t PIN_LITR_TV = 2;
+constexpr uint8_t PIN_SV = 3;
+constexpr uint8_t PIN_TV = 4;
 
+constexpr uint8_t SENSOR_SETTLE_MS = 2;
+constexpr uint8_t OUTPUT_PULSE_MS = 100;
+
+bool posledniStavSV = HIGH;
+bool posledniStavTV = HIGH;
+
+// The watchdog interrupt is used only as a wake-up source.
 ISR(WDT_vect)
 {
-  //když je proměnná impuls_z_wdt na 0
-  if (impuls_z_wdt == 0)
-  {
-    // zapiš do proměnné 1
-    impuls_z_wdt = 1;
-  }
 }
 
-volatile boolean StavSV;
-volatile boolean posledniStavSV;
-volatile boolean StavTV;
-volatile boolean posledniStavTV;
+static void nastavWatchdog()
+{
+  const uint8_t oldSreg = SREG;
+
+  cli();
+  wdt_reset();
+
+  // Clear a possible watchdog-reset flag first.
+  MCUSR &= ~_BV(WDRF);
+
+  // Timed sequence required by the ATtiny85 watchdog.
+  // Interrupt-only mode, nominal timeout about 1 s.
+  WDTCR = _BV(WDCE) | _BV(WDE);
+  WDTCR = _BV(WDIE) | _BV(WDP2) | _BV(WDP1);
+
+  SREG = oldSreg;
+}
+
+static void uspatDoWatchdogu()
+{
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+
+  // Avoid the race where the watchdog fires between enabling sleep
+  // and executing the SLEEP instruction.
+  cli();
+  sleep_enable();
+  sei();
+  sleep_cpu();
+  sleep_disable();
+}
+
+static void zapnoutCidla()
+{
+  digitalWrite(PIN_NAPAJENI_OPTOSENZORU, HIGH);
+  delay(SENSOR_SETTLE_MS);
+}
+
+static void vypnoutCidla()
+{
+  digitalWrite(PIN_NAPAJENI_OPTOSENZORU, LOW);
+}
+
+static void inicializovatStavyCidel()
+{
+  zapnoutCidla();
+  posledniStavSV = (digitalRead(PIN_SV) == HIGH);
+  posledniStavTV = (digitalRead(PIN_TV) == HIGH);
+  vypnoutCidla();
+}
+
+static void zpracovatCidla()
+{
+  zapnoutCidla();
+
+  // Read both sensors before producing either output pulse so one
+  // 100 ms report pulse cannot delay the second sensor measurement.
+  const bool stavSV = (digitalRead(PIN_SV) == HIGH);
+  const bool stavTV = (digitalRead(PIN_TV) == HIGH);
+
+  vypnoutCidla();
+
+  // Preserve the original behaviour: report only a HIGH -> LOW edge.
+  const bool impulsSV = posledniStavSV && !stavSV;
+  const bool impulsTV = posledniStavTV && !stavTV;
+
+  posledniStavSV = stavSV;
+  posledniStavTV = stavTV;
+
+  if (!impulsSV && !impulsTV)
+  {
+    return;
+  }
+
+  if (impulsSV)
+  {
+    digitalWrite(PIN_LITR_SV, HIGH);
+  }
+
+  if (impulsTV)
+  {
+    digitalWrite(PIN_LITR_TV, HIGH);
+  }
+
+  delay(OUTPUT_PULSE_MS);
+
+  if (impulsSV)
+  {
+    digitalWrite(PIN_LITR_SV, LOW);
+  }
+
+  if (impulsTV)
+  {
+    digitalWrite(PIN_LITR_TV, LOW);
+  }
+}
 
 void setup()
 {
+  pinMode(PIN_NAPAJENI_OPTOSENZORU, OUTPUT);
+  digitalWrite(PIN_NAPAJENI_OPTOSENZORU, LOW);
 
-  pinMode(PIN_napajeni_optosenzoru, OUTPUT);
+  // Keep the original electrical semantics. The external sensor circuit
+  // must provide a defined HIGH/LOW level; internal pull-ups are not enabled.
   pinMode(PIN_SV, INPUT);
-  pinMode(LitrSV, OUTPUT);
   pinMode(PIN_TV, INPUT);
-  pinMode(LitrTV, OUTPUT);
 
-  // nastavení WATCHDOG TIMERU
-  MCUSR &= ~(1 << WDRF);              // neřešte
-  WDTCSR |= (1 << WDCE) | (1 << WDE); // neřešte
+  pinMode(PIN_LITR_SV, OUTPUT);
+  pinMode(PIN_LITR_TV, OUTPUT);
+  digitalWrite(PIN_LITR_SV, LOW);
+  digitalWrite(PIN_LITR_TV, LOW);
 
-  // nastavení času impulsu
-  /**
-	 *	Setting the watchdog pre-scaler value with VCC = 5.0V and 16mHZ
-	 *	WDP3 WDP2 WDP1 WDP0 | Number of WDT | Typical Time-out at Oscillator Cycles
-	 *	0    0    0    0    |   2K cycles   | 16 ms
-	 *	0    0    0    1    |   4K cycles   | 32 ms
-	 *	0    0    1    0    |   8K cycles   | 64 ms
-	 *	0    0    1    1    |  16K cycles   | 0.125 s
-	 *	0    1    0    0    |  32K cycles   | 0.25 s
-	 *	0    1    0    1    |  64K cycles   | 0.5 s
-	 *	0    1    1    0    |  128K cycles  | 1.0 s
-	 *	0    1    1    1    |  256K cycles  | 2.0 s
-	 *	1    0    0    0    |  512K cycles  | 4.0 s
-	 *	1    0    0    1    | 1024K cycles  | 8.0 s
-	*/
-  WDTCSR = (0 << WDP3) | (1 << WDP2) | (1 << WDP1) | (0 << WDP0);
+  // ADC and analog comparator are not used.
+  ADCSRA &= ~_BV(ADEN);
+  ACSR |= _BV(ACD);
 
-  WDTCSR |= _BV(WDIE); //neřešte
-}
-
-void enterSleep(void)
-{
-  //nastavení nejúspornějšího módu
-  set_sleep_mode(SLEEP_MODE_STANDBY);
-  // spánkový režim je povolený
-  sleep_enable();
-  // spuštění režimu spánku
-  sleep_mode();
-
-  // tady bude program pokračovat když se probudí
-
-  // spánek zakázán
-  sleep_disable();
-  //znovu zapojení všech funkcí
-  power_all_enable();
-}
-
-void TeplaVoda()
-{
-  StavTV = digitalRead(PIN_TV);
-
-  // porovnejte buttonState (stav tlačítka) s předchozím stavem
-  if (StavTV != posledniStavTV)
-  {
-    // jestliže se stav změnil, navyšte hodnotu počítadla
-    if (StavTV == LOW)
-    {
-      // jestliže je současný stav HIGH, tlačítko přešlo
-      //z off na on:
-      digitalWrite(LitrTV, HIGH);
-      delay(100);
-      digitalWrite(LitrTV, LOW);
-    }
-    else
-    {
-      // jestliže je současný stav LOW, tlačítko přešlo
-      // z on na off:
-    }
-  }
-  // uložte současný stav jako „poslední stav“,
-  //abyste ho mohli v příští smyčce použít
-  posledniStavTV = StavTV;
-}
-
-void StudenaVoda()
-{
-  StavSV = digitalRead(PIN_SV);
-
-  // porovnejte buttonState (stav tlačítka) s předchozím stavem
-  if (StavSV != posledniStavSV)
-  {
-    // jestliže se stav změnil, navyšte hodnotu počítadla
-    if (StavSV == LOW)
-    {
-      // jestliže je současný stav HIGH, tlačítko přešlo
-      //z off na on:
-      digitalWrite(LitrSV, HIGH);
-      delay(100);
-      digitalWrite(LitrSV, LOW);
-    }
-    else
-    {
-      // jestliže je současný stav LOW, tlačítko přešlo
-      // z on na off:
-    }
-  }
-  // uložte současný stav jako „poslední stav“,
-  //abyste ho mohli v příští smyčce použít
-  posledniStavSV = StavSV;
+  inicializovatStavyCidel();
+  nastavWatchdog();
 }
 
 void loop()
 {
-  digitalWrite(PIN_napajeni_optosenzoru, HIGH);
-  delay(1);
-  StudenaVoda();
-  TeplaVoda();
-  delay(1);
-  digitalWrite(PIN_napajeni_optosenzoru, LOW);
-  enterSleep();
+  // Sensors stay unpowered while the MCU sleeps. The watchdog wakes the
+  // device roughly once per second for one measurement cycle.
+  uspatDoWatchdogu();
+  zpracovatCidla();
 }
